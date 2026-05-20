@@ -8,8 +8,10 @@
   Layer 3 : 時計・次チャイム・ボタン類 (canvas window item)
 
 スケジュールファイル形式 (タブ or スペース区切り):
-  HH:MM  画像ファイル  表示文字  色  大きさ  フォント
+  HH:MM  画像ファイル  表示文字  色  大きさ  フォント  BGM音声ファイル
   ※ "-" で「なし」を指定。画像ファイル以降は省略可。
+  ※ BGM音声ファイル(MP3/WAV/FLAC/OGG)を指定すると次のチャイム時刻までループ再生し、
+    2秒前からフェードアウトする。
 
 日程Excelファイル形式:
   「日程」シートの「月日」列で今日の行を検索し、
@@ -37,7 +39,7 @@
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, colorchooser
-from datetime import datetime
+from datetime import datetime, timedelta
 import threading
 import time
 import os
@@ -46,6 +48,7 @@ from typing import Optional, List, Dict
 
 import numpy as np
 import sounddevice as sd
+import miniaudio
 from scipy.io import wavfile
 from PIL import Image, ImageTk
 import pandas as pd
@@ -182,7 +185,7 @@ def load_today_from_excel(excel_path: str) -> Optional[Dict[str, str]]:
 def parse_schedule_line(line: str) -> Optional[Dict]:
     """
     スケジュール行をパースして dict を返す。
-    フォーマット: HH:MM  画像  表示文字  色  大きさ  フォント
+    フォーマット: HH:MM  画像  表示文字  色  大きさ  フォント  BGMファイル
     省略フィールドは None、"-" も None として扱う。
     """
     line = line.strip()
@@ -202,10 +205,128 @@ def parse_schedule_line(line: str) -> Optional[Dict]:
             "color": v(3),
             "size" : int(v(4)) if v(4) else None,
             "font" : v(5).replace("_", " ") if v(5) else None,
+            "bgm"  : v(6),
         }
     except Exception as e:
         print(f"スケジュール行パースエラー: {line!r} → {e}")
         return None
+
+
+# -----------------------------------------------------------------------
+# BGM プレイヤー
+# -----------------------------------------------------------------------
+class BGMPlayer:
+    """MP3/WAV/FLAC/OGG をループ再生し、フェードアウト停止に対応するプレイヤー。"""
+
+    _BLOCKSIZE = 1024
+
+    def __init__(self) -> None:
+        self._stream:      Optional[sd.OutputStream] = None
+        self._data:        Optional[np.ndarray]       = None
+        self._samplerate:  int   = 44100
+        self._pos:         int   = 0
+        self._fade_total:  int   = 0  # フェードアウト総サンプル数 (0 = フェードなし)
+        self._fade_pos:    int   = 0  # フェードアウト経過サンプル数
+        self._lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    def play(self, path: str) -> bool:
+        """path の音声ファイル(MP3/WAV/FLAC/OGG)をループ再生する。成功時 True を返す。"""
+        self.stop()
+        if not os.path.exists(path):
+            print(f"BGMファイルが見つかりません: {path}")
+            return False
+        try:
+            decoded = miniaudio.decode_file(
+                path,
+                output_format=miniaudio.SampleFormat.FLOAT32,
+                nchannels=2,
+            )
+            data = np.frombuffer(decoded.samples, dtype=np.float32).reshape(-1, 2).copy()
+            sr   = decoded.sample_rate
+            with self._lock:
+                self._data       = data
+                self._samplerate = sr
+                self._pos        = 0
+                self._fade_total = 0
+                self._fade_pos   = 0
+            self._stream = sd.OutputStream(
+                samplerate=sr,
+                channels=2,
+                dtype="float32",
+                blocksize=self._BLOCKSIZE,
+                callback=self._callback,
+            )
+            self._stream.start()
+            return True
+        except Exception as e:
+            print(f"BGM再生エラー: {e}")
+            return False
+
+    # ------------------------------------------------------------------
+    def _callback(self, outdata: np.ndarray, frames: int,
+                  time_info, status) -> None:
+        with self._lock:
+            if self._data is None:
+                outdata[:] = 0
+                return
+
+            # ループ読み出し
+            buf = np.empty((frames, self._data.shape[1]), dtype=np.float32)
+            filled = 0
+            while filled < frames:
+                avail = len(self._data) - self._pos
+                take  = min(avail, frames - filled)
+                buf[filled:filled + take] = self._data[self._pos:self._pos + take]
+                self._pos  += take
+                filled     += take
+                if self._pos >= len(self._data):
+                    self._pos = 0
+
+            # フェードアウト適用（リニア減衰）
+            if self._fade_total > 0:
+                fade_left = self._fade_total - self._fade_pos
+                if fade_left <= 0:
+                    outdata[:] = 0
+                    return
+                apply = min(frames, fade_left)
+                t0 = self._fade_pos / self._fade_total
+                t1 = min((self._fade_pos + apply) / self._fade_total, 1.0)
+                ramp = np.linspace(1.0 - t0, 1.0 - t1, apply, dtype=np.float32)
+                buf[:apply] *= ramp[:, np.newaxis]
+                if apply < frames:
+                    buf[apply:] = 0
+                self._fade_pos += frames
+
+            outdata[:] = buf
+
+    # ------------------------------------------------------------------
+    def start_fadeout(self, duration_secs: float = 2.0) -> None:
+        """duration_secs 秒かけてリニアフェードアウトを開始する。"""
+        with self._lock:
+            if self._data is None or self._fade_total > 0:
+                return
+            self._fade_total = max(1, int(duration_secs * self._samplerate))
+            self._fade_pos   = 0
+
+    # ------------------------------------------------------------------
+    @property
+    def is_playing(self) -> bool:
+        return self._stream is not None and self._stream.active
+
+    # ------------------------------------------------------------------
+    def stop(self) -> None:
+        """再生を即時停止してリソースを解放する。"""
+        with self._lock:
+            self._data       = None
+            self._fade_total = 0
+        s, self._stream = self._stream, None
+        if s:
+            try:
+                s.stop()
+                s.close()
+            except Exception:
+                pass
 
 
 # -----------------------------------------------------------------------
@@ -614,6 +735,10 @@ class ChimeApp:
         self.chime_played_today: set     = set()
         self.schedule_file_relpath: Optional[str] = self._cfg.get(KEY_SCHEDULE)
 
+        # BGM
+        self.bgm_player: BGMPlayer          = BGMPlayer()
+        self._bgm_fadeout_id: Optional[int] = None  # root.after() の戻り値
+
         # チェック変数
         # KEY_FRONTMOST が未設定（None）のとき != "False" が True になるのを防ぐ
         _frontmost = self._cfg.get(KEY_FRONTMOST, "True")
@@ -635,8 +760,7 @@ class ChimeApp:
         # 起動時の初期画面
         entry = self._get_current_entry()
         if entry:
-            self.show_image(entry.get("image") or DEFAULT_IMAGE,
-                            pending_overlay=entry if entry.get("text") else None)
+            self._apply_schedule_entry(entry)
         else:
             # スケジュール開始前 → 準備中画面
             self.show_image(DEFAULT_IMAGE)
@@ -1150,6 +1274,49 @@ class ChimeApp:
     def _apply_schedule_entry(self, entry: Dict) -> None:
         overlay = entry if entry.get("text") else None
         self.show_image(entry.get("image"), pending_overlay=overlay)
+        self._start_bgm_for_entry(entry)
+
+    def _start_bgm_for_entry(self, entry: Dict) -> None:
+        """エントリの bgm フィールドに従い BGM を開始または停止する。"""
+        # 既存のフェードアウトタイマーをキャンセル
+        if self._bgm_fadeout_id is not None:
+            self.root.after_cancel(self._bgm_fadeout_id)
+            self._bgm_fadeout_id = None
+
+        bgm_path = entry.get("bgm")
+        if not bgm_path:
+            self.bgm_player.stop()
+            return
+
+        resolved = self._resolve_path(bgm_path)
+        if not resolved:
+            print(f"BGMファイルが見つかりません: {bgm_path}")
+            self.bgm_player.stop()
+            return
+
+        if self.bgm_player.play(resolved):
+            self._schedule_bgm_fadeout(entry["time"])
+
+    def _schedule_bgm_fadeout(self, current_time_str: str) -> None:
+        """次のチャイム時刻の 2 秒前にフェードアウトを予約する。"""
+        now = datetime.now()
+        future = [e for e in self.schedule_data if e["time"] > current_time_str]
+        if not future:
+            return
+
+        h, m = map(int, future[0]["time"].split(":"))
+        next_dt    = now.replace(hour=h, minute=m, second=0, microsecond=0)
+        fadeout_dt = next_dt - timedelta(seconds=2)
+        delay_ms   = int((fadeout_dt - now).total_seconds() * 1000)
+        if delay_ms < 0:
+            return
+
+        self._bgm_fadeout_id = self.root.after(delay_ms, self._do_bgm_fadeout)
+
+    def _do_bgm_fadeout(self) -> None:
+        """フェードアウト実行（root.after コールバック）。"""
+        self._bgm_fadeout_id = None
+        self.bgm_player.start_fadeout(2.0)
 
     # ===================================================================
     # スケジュール復帰
@@ -1160,6 +1327,10 @@ class ChimeApp:
         if entry:
             self._apply_schedule_entry(entry)
         else:
+            self.bgm_player.stop()
+            if self._bgm_fadeout_id is not None:
+                self.root.after_cancel(self._bgm_fadeout_id)
+                self._bgm_fadeout_id = None
             self.show_image(DEFAULT_IMAGE)
 
     # ===================================================================
