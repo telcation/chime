@@ -227,6 +227,7 @@ class BGMPlayer:
         self._pos:         int   = 0
         self._fade_total:  int   = 0  # フェードアウト総サンプル数 (0 = フェードなし)
         self._fade_pos:    int   = 0  # フェードアウト経過サンプル数
+        self._paused:      bool  = False  # pause() で一時停止中か
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------
@@ -237,8 +238,10 @@ class BGMPlayer:
             print(f"BGMファイルが見つかりません: {path}")
             return False
         try:
-            decoded = miniaudio.decode_file(
-                path,
+            with open(path, "rb") as f:
+                audio_bytes = f.read()
+            decoded = miniaudio.decode(
+                audio_bytes,
                 output_format=miniaudio.SampleFormat.FLOAT32,
                 nchannels=2,
             )
@@ -315,12 +318,55 @@ class BGMPlayer:
         return self._stream is not None and self._stream.active
 
     # ------------------------------------------------------------------
+    def pause(self) -> None:
+        """BGM を一時停止する（位置を保持するため resume() で再開可能）。"""
+        with self._lock:
+            if self._data is None:
+                return
+            self._paused = True
+            s, self._stream = self._stream, None
+        if s:
+            try:
+                s.stop()
+                s.close()
+            except Exception:
+                pass
+
+    def resume(self) -> None:
+        """pause() で一時停止した BGM を再開する。play() で差し替え済みなら何もしない。"""
+        with self._lock:
+            if not self._paused or self._data is None:
+                return
+            self._paused = False
+            sr       = self._samplerate
+            channels = self._data.shape[1]
+        stream = sd.OutputStream(
+            samplerate=sr,
+            channels=channels,
+            dtype="float32",
+            blocksize=self._BLOCKSIZE,
+            callback=self._callback,
+        )
+        stream.start()
+        with self._lock:
+            # stop() や play() が割り込んでいなければストリームを登録する
+            if self._data is not None and not self._paused:
+                self._stream = stream
+            else:
+                try:
+                    stream.stop()
+                    stream.close()
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------------
     def stop(self) -> None:
         """再生を即時停止してリソースを解放する。"""
         with self._lock:
             self._data       = None
             self._fade_total = 0
-        s, self._stream = self._stream, None
+            self._paused     = False
+            s, self._stream  = self._stream, None
         if s:
             try:
                 s.stop()
@@ -1257,15 +1303,18 @@ class ChimeApp:
     # スケジュール監視
     # ===================================================================
     def _monitor_schedule(self) -> None:
-        def play_chime():
-            if not os.path.exists(CHIME_WAV_PATH):
-                return
+        def play_chime_then_bgm(entry: Dict) -> None:
+            # BGM を即停止してからチャイムを再生し、終了後に新エントリの BGM を開始する
+            self.bgm_player.stop()
             try:
-                samplerate, data = wavfile.read(CHIME_WAV_PATH)
-                sd.play(data, samplerate)
-                sd.wait()
+                if os.path.exists(CHIME_WAV_PATH):
+                    samplerate, data = wavfile.read(CHIME_WAV_PATH)
+                    sd.play(data, samplerate)
+                    sd.wait()
             except Exception as e:
                 print(f"チャイム再生エラー: {e}")
+            finally:
+                self.canvas.after(0, lambda: self._start_bgm_for_entry(entry))
 
         last_checked = ""
         while True:
@@ -1279,11 +1328,17 @@ class ChimeApp:
                             self.root.lift()
                             self.root.attributes("-topmost", True)
                             self.root.after(1000, lambda: self.root.attributes("-topmost", False))
-                        self.canvas.after(0, lambda e=entry: self._apply_schedule_entry(e))
-                        threading.Thread(target=play_chime, daemon=True).start()
+                        self.canvas.after(0, lambda e=entry: self._apply_visual_only(e))
+                        threading.Thread(target=play_chime_then_bgm,
+                                         args=(entry,), daemon=True).start()
                         self.chime_played_today.add(now_min)
                 last_checked = now_min
             time.sleep(2)
+
+    def _apply_visual_only(self, entry: Dict) -> None:
+        """画像・オーバーレイのみ適用する（BGM はチャイム後に別途開始）。"""
+        overlay = entry if entry.get("text") else None
+        self.show_image(entry.get("image"), pending_overlay=overlay)
 
     def _apply_schedule_entry(self, entry: Dict) -> None:
         overlay = entry if entry.get("text") else None
