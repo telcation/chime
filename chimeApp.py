@@ -1015,6 +1015,7 @@ class ChimeApp:
                 )
             elif is_standby:
                 self._show_standby_hints()
+                self._start_standby_bgm()
 
         cw = self.canvas.winfo_width()
         ch = self.canvas.winfo_height()
@@ -1118,6 +1119,19 @@ class ChimeApp:
                 font_name = sb["font"],
                 bg_color  = sb["tool_bg"],
             )
+
+    def _start_standby_bgm(self) -> None:
+        """「準備中」という名前の音声ファイルがあれば BGM として再生する。"""
+        if self._bgm_fadeout_id is not None:
+            self.root.after_cancel(self._bgm_fadeout_id)
+            self._bgm_fadeout_id = None
+        for ext in (".mp3", ".wav", ".flac", ".ogg"):
+            path = os.path.join(BASE_DIR, f"準備中{ext}")
+            if os.path.exists(path):
+                if self.bgm_player.play(path):
+                    self._schedule_bgm_fadeout(datetime.now().strftime("%H:%M"))
+                return
+        self.bgm_player.stop()
 
     # ===================================================================
     # オーバーレイ管理
@@ -1327,10 +1341,6 @@ class ChimeApp:
         if entry:
             self._apply_schedule_entry(entry)
         else:
-            self.bgm_player.stop()
-            if self._bgm_fadeout_id is not None:
-                self.root.after_cancel(self._bgm_fadeout_id)
-                self._bgm_fadeout_id = None
             self.show_image(DEFAULT_IMAGE)
 
     # ===================================================================
